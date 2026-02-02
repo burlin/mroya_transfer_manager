@@ -1,0 +1,19 @@
+# Main dependencies for Mroya Transfer Manager
+# 
+# Note: some dependencies may be available through other plugins:
+# - boto3 may be in multi-site-location-0.2.0/dependencies
+# - fileseq may be in ftrack_inout/dependencies
+# - ftrack-api is usually installed with ftrack Connect
+# - PySide6/PySide2 are usually provided by ftrack Connect or DCC applications
+
+# Ftrack API (usually installed with ftrack Connect)
+ftrack-python-api
+
+# AWS SDK for S3 multipart upload
+boto3>=1.26.0
+
+# Sequence file handling
+fileseq>=1.0.0
+
+# Qt bindings (usually installed with ftrack Connect)
+# PySide6 or PySide2 (not in requirements as they come with ftrack Connect)
