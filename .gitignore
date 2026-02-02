@@ -26,6 +26,12 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# Un-ignore plugin's hook/lib (custom_transfer etc.) - standard lib/ above ignores all lib/
+!hook/lib/
+!hook/lib/**
+# But ignore cache under hook/lib
+hook/lib/__pycache__/
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
