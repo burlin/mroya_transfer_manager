@@ -1625,7 +1625,13 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
         self.job_table.setHorizontalHeaderLabels([
             "Component", "Destination", "Size", "Status", "Progress", "Time", "Speed", "Actions"
         ])
-        self.job_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        # Allow user to resize columns (drag header borders); Component can be widened, Speed narrowed
+        header = self.job_table.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        header.setMinimumSectionSize(40)
+        default_widths = [280, 120, 70, 60, 70, 75, 75, 90]  # Component wider, Speed/Time compact
+        for col in range(8):
+            self.job_table.setColumnWidth(col, default_widths[col])
         self.job_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.job_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         
@@ -1652,6 +1658,13 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
         
         max_workers = self._settings.value("max_workers", 10, type=int)
         self.max_workers_spinbox.setValue(max_workers)
+        
+        # Restore saved column widths for job table
+        for col in range(8):
+            w = self._settings.value(f"job_table_col_{col}", None, type=int)
+            if w is not None and w >= 40:
+                self.job_table.setColumnWidth(col, w)
+        self.job_table.horizontalHeader().sectionResized.connect(self._save_job_table_column_widths)
         
         # Track active jobs
         # Structure: {job_id: {'row': int, 'start_time': float, 'last_elapsed_time': float, 'last_speed': float}}
@@ -1696,6 +1709,16 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
             # Note: this value will be applied to new jobs
         except Exception as e:
             logger.warning(f"Error updating max workers: {e}")
+    
+    def _save_job_table_column_widths(self, logical_index, old_size, new_size):
+        """Persist job table column widths when user resizes."""
+        try:
+            for col in range(self.job_table.columnCount()):
+                w = self.job_table.columnWidth(col)
+                if w >= 40:
+                    self._settings.setValue(f"job_table_col_{col}", w)
+        except Exception as e:
+            logger.debug("Save job table column widths: %s", e)
     
     def _start_event_listener(self):
         """Subscribe to ftrack transfer status events."""
