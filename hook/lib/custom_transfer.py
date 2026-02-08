@@ -624,6 +624,9 @@ def transfer_component_custom(
             logger.error("✗ Target location должна быть Disk или S3")
             return False
         
+        # For sequence: collect resource_identifiers per member (frame order) so we can register members for availability
+        member_resource_ids = []
+        
         # 4. Проверяем, является ли это последовательностью и получаем список файлов
         is_sequence = False
         sequence_files = []  # Для Disk: пути к файлам, для S3: список (key, frame_num)
@@ -874,6 +877,7 @@ def transfer_component_custom(
                         )
                     return thread_local.s3_client
                 
+                member_resource_ids_s3 = []  # For sequence: resource_identifier per member (frame order)
                 if len(sequence_files) > 1:
                     # Последовательность файлов из S3
                     max_workers = job_data.get('max_workers', 10) if job_data else 10
@@ -897,6 +901,7 @@ def transfer_component_custom(
                         
                         file_target_path = target_location.accessor.get_filesystem_path(file_resource_id)
                         tasks.append((idx, source_key, file_target_path, frame_num))
+                        member_resource_ids_s3.append(file_resource_id)
                     
                     # Получаем общий размер всех файлов из S3
                     total_size = 0
@@ -964,6 +969,7 @@ def transfer_component_custom(
                         logger.info(f"✓ Последовательность скачана: {files_copied}/{len(tasks)} файлов, {total_bytes} bytes")
                         success = True
                         bytes_copied = total_bytes
+                        member_resource_ids.extend(member_resource_ids_s3)
                     else:
                         logger.error(f"✗ Ошибки при скачивании: {files_failed} файлов не скачаны")
                         success = False
@@ -1015,6 +1021,7 @@ def transfer_component_custom(
                         if file_success:
                             total_bytes += file_bytes
                             files_copied += 1
+                            member_resource_ids.append(file_resource_id)
                     
                     if files_copied == len(sequence_files):
                         logger.info(f"✓ Последовательность скопирована: {files_copied}/{len(sequence_files)} файлов, {total_bytes} bytes")
@@ -1039,7 +1046,32 @@ def transfer_component_custom(
             return False
         
         # 6. Регистрируем компонент в target location
+        # For SequenceComponent, API computes availability from members; register members first so availability becomes 100%
         try:
+            if is_sequence and component.entity_type == 'SequenceComponent' and member_resource_ids:
+                session.populate(component, 'members')
+                members = component.get('members') or []
+                if members:
+                    # Sort members by name (frame index) to match member_resource_ids order
+                    try:
+                        members_sorted = sorted(members, key=lambda m: int(m.get('name', 0)))
+                    except (ValueError, TypeError):
+                        members_sorted = members
+                    for member, res_id in zip(members_sorted, member_resource_ids):
+                        try:
+                            session.create(
+                                'ComponentLocation',
+                                data={
+                                    'component': member,
+                                    'location': target_location,
+                                    'resource_identifier': res_id
+                                }
+                            )
+                        except Exception as e:
+                            if 'DuplicateEntryError' not in str(type(e).__name__):
+                                logger.warning(f"ComponentLocation for member {member.get('name')}: {e}")
+                    logger.info(f"✓ Зарегистрировано {min(len(members_sorted), len(member_resource_ids))} members в target location")
+            
             component_location = session.create(
                 'ComponentLocation',
                 data={
@@ -1060,6 +1092,8 @@ def transfer_component_custom(
             logger.error(f"✗ Ошибка регистрации: {e}", exc_info=True)
             return False
             
+    except TransferError:
+        raise
     except Exception as e:
         logger.error(f"✗ Ошибка трансфера компонента: {e}", exc_info=True)
         return False
