@@ -1028,6 +1028,18 @@ class BackgroundTransferManager:
         try:
             src_location = self._session.get("Location", str(from_location_id))
             dst_location = self._session.get("Location", str(to_location_id))
+            logger.info(
+                "MroyaTransferManager: resolved locations src=%s (id=%s) dst=%s (id=%s) "
+                "src_structure=%s dst_structure=%s src_accessor=%s dst_accessor=%s",
+                src_location.get('name', '?') if src_location else None,
+                str(from_location_id)[:8] if from_location_id else '?',
+                dst_location.get('name', '?') if dst_location else None,
+                str(to_location_id)[:8] if to_location_id else '?',
+                type(getattr(src_location, 'structure', None)).__name__ if src_location else '?',
+                type(getattr(dst_location, 'structure', None)).__name__ if dst_location else '?',
+                type(getattr(src_location, 'accessor', None)).__name__ if src_location else '?',
+                type(getattr(dst_location, 'accessor', None)).__name__ if dst_location else '?',
+            )
         except Exception as exc:
             logger.error("MroyaTransferManager: failed to resolve locations: %s", exc, exc_info=True)
             return
@@ -1381,6 +1393,14 @@ class BackgroundTransferManager:
                                 pass
                 
                 # Call custom transfer
+                logger.debug(
+                    "MroyaTransferManager: calling transfer_component_custom component=%s (%s) "
+                    "src=%s dst=%s",
+                    component.get('name', '?'),
+                    component.get('id', '?')[:8],
+                    src_location.get('name', '?'),
+                    dst_location.get('name', '?'),
+                )
                 success = transfer_component_custom(
                     session=self._session,
                     component=component,
@@ -1399,10 +1419,18 @@ class BackgroundTransferManager:
                 
                 if success:
                     success_count += 1
+                    logger.info(
+                        "MroyaTransferManager: component %s transferred successfully (%s -> %s)",
+                        component.get('id', '?')[:8], src_location.get('name', '?'), dst_location.get('name', '?')
+                    )
                     # Increment completed components counter for next component
                     completed_components[0] += 1
                 else:
                     failed_count += 1
+                    logger.warning(
+                        "MroyaTransferManager: transfer_component_custom returned False for component %s",
+                        component.get('id', '?')[:8]
+                    )
                     # Even on error, component is considered processed
                     completed_components[0] += 1
                     if not ignore_errors:
@@ -1414,16 +1442,21 @@ class BackgroundTransferManager:
                 # Don't increment failed_count, just exit
                 return
             except Exception as exc:
-                logger.exception('Failed to transfer component.')
-                
+                logger.exception(
+                    'Failed to transfer component: component=%s src=%s dst=%s error=%s',
+                    component.get('id', '?')[:8], src_location.get('name', '?'),
+                    dst_location.get('name', '?'), exc
+                )
                 # Log error to transfer_logger for detailed analysis
                 import traceback
                 error_details = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
                 transfer_logger.error(
                     f"COMPONENT_TRANSFER_ERROR | job_id={job['id']} | "
                     f"component_id={component.get('id', 'unknown')[:8]} | "
+                    f"component_name={component.get('name', '?')} | "
+                    f"src={src_location.get('name', '?')} | dst={dst_location.get('name', '?')} | "
                     f"error={str(exc)} | "
-                    f"traceback={error_details[:500]}"  # First 500 characters of traceback
+                    f"traceback={error_details[:2000]}"
                 )
                 
                 # Check if Job was stopped by user (use cache, non-blocking)

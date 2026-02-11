@@ -30,6 +30,38 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _ensure_location_structure(location):
+    """Ensure location has a valid structure (not Symbol) for get_resource_identifier.
+
+    Plugin-configured locations (S3, user disk) may have structure as Symbol when
+    Location is fetched via session.get() before configure-location has run.
+    Fallback to StandardStructure for our use case.
+    """
+    loc_name = getattr(location, 'name', None) or location.get('name', 'unknown')
+    loc_id = getattr(location, 'id', None) or location.get('id', 'unknown')
+    structure = getattr(location, 'structure', None)
+    structure_type = type(structure).__name__ if structure is not None else 'None'
+    has_gri = callable(getattr(structure, 'get_resource_identifier', None))
+    logger.debug(
+        "Location structure check: name=%s id=%s structure_type=%s has_get_resource_identifier=%s",
+        loc_name, loc_id[:8] if loc_id else '?', structure_type, has_gri
+    )
+    if structure is None:
+        logger.info(
+            "Location %s: structure is None, applying StandardStructure fallback",
+            loc_name
+        )
+        location.structure = ftrack_api.structure.standard.StandardStructure()
+        return
+    if not has_gri:
+        logger.info(
+            "Location %s: structure type=%s has no get_resource_identifier, applying StandardStructure fallback",
+            loc_name, structure_type
+        )
+        location.structure = ftrack_api.structure.standard.StandardStructure()
+
+
 # Multipart threshold (5MB)
 MULTIPART_THRESHOLD = 5 * 1024 * 1024  # 5MB
 MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
@@ -584,8 +616,22 @@ def transfer_component_custom(
     Returns:
         True если успешно, False если ошибка
     """
+    src_name = source_location.get('name', 'unknown')
+    dst_name = target_location.get('name', 'unknown')
+    comp_id = component.get('id', 'unknown')
+    comp_name = component.get('name', 'unknown')
+    logger.info(
+        "transfer_component_custom: component=%s (%s) source=%s -> target=%s",
+        comp_name, comp_id[:8] if comp_id else '?', src_name, dst_name
+    )
     try:
+        # Ensure locations have valid structure (not Symbol from unresolved reference)
+        logger.debug("Ensuring location structures for %s and %s", src_name, dst_name)
+        _ensure_location_structure(source_location)
+        _ensure_location_structure(target_location)
+
         # 1. Получаем source resource_identifier и путь
+        logger.debug("Getting source resource_identifier for component %s", comp_id[:8])
         source_resource_id = source_location.get_resource_identifier(component)
         logger.info(f"  Source resource_identifier: {source_resource_id}")
         
@@ -594,19 +640,26 @@ def transfer_component_custom(
         is_s3_source = False
         is_disk_source = False
         
+        src_accessor_type = type(source_location.accessor).__name__ if source_location.accessor else 'None'
         if source_location.accessor:
             if 's3' in str(type(source_location.accessor)).lower():
                 is_s3_source = True
+                logger.debug("Source location %s: S3 accessor (%s)", src_name, src_accessor_type)
             elif isinstance(source_location.accessor, ftrack_api.accessor.disk.DiskAccessor):
                 is_disk_source = True
                 source_path = source_location.get_filesystem_path(component)
+                logger.debug("Source location %s: Disk accessor (%s), path=%s", src_name, src_accessor_type, source_path)
         
         if not is_s3_source and not is_disk_source:
-            logger.error("✗ Source location должна быть Disk или S3")
+            logger.error(
+                "Source location %s has unsupported accessor: %s (expected S3 or Disk)",
+                src_name, src_accessor_type
+            )
             return False
         
         # 2. Генерируем target resource_identifier
         context = {'source_resource_identifier': source_resource_id}
+        logger.debug("Generating target resource_identifier for component %s", comp_id[:8])
         target_resource_id = target_location.structure.get_resource_identifier(component, context)
         logger.info(f"  Target resource_identifier: {target_resource_id}")
         
@@ -614,14 +667,20 @@ def transfer_component_custom(
         is_s3_target = False
         is_disk_target = False
         
+        dst_accessor_type = type(target_location.accessor).__name__ if target_location.accessor else 'None'
         if target_location.accessor:
             if 's3' in str(type(target_location.accessor)).lower():
                 is_s3_target = True
+                logger.debug("Target location %s: S3 accessor (%s)", dst_name, dst_accessor_type)
             elif isinstance(target_location.accessor, ftrack_api.accessor.disk.DiskAccessor):
                 is_disk_target = True
+                logger.debug("Target location %s: Disk accessor (%s)", dst_name, dst_accessor_type)
         
         if not is_s3_target and not is_disk_target:
-            logger.error("✗ Target location должна быть Disk или S3")
+            logger.error(
+                "Target location %s has unsupported accessor: %s (expected S3 or Disk)",
+                dst_name, dst_accessor_type
+            )
             return False
         
         # For sequence: collect resource_identifiers per member (frame order) so we can register members for availability
@@ -748,6 +807,7 @@ def transfer_component_custom(
         
         if is_s3_target:
             # Копирование в S3
+            logger.info("Transfer path: %s -> S3 (bucket)", "Disk" if is_disk_source else "S3")
             s3_bucket = os.getenv('S3_BUCKET', 'proj')
             s3_endpoint = os.getenv('S3_MINIO_ENDPOINT_URL')
             
@@ -856,7 +916,9 @@ def transfer_component_custom(
         
         elif is_disk_target:
             # Копирование на Disk
+            logger.info("Transfer path: %s -> Disk", "Disk" if is_disk_source else "S3")
             target_path = target_location.accessor.get_filesystem_path(target_resource_id)
+            logger.debug("Target disk path: %s", target_path)
             
             if is_s3_source:
                 # S3 -> Disk
@@ -1046,6 +1108,7 @@ def transfer_component_custom(
             return False
         
         # 6. Регистрируем компонент в target location
+        logger.info("Registering component %s in target location %s", comp_id[:8], dst_name)
         # For SequenceComponent, API computes availability from members; register members first so availability becomes 100%
         try:
             if is_sequence and component.entity_type == 'SequenceComponent' and member_resource_ids:
@@ -1092,8 +1155,13 @@ def transfer_component_custom(
             logger.error(f"✗ Ошибка регистрации: {e}", exc_info=True)
             return False
             
-    except TransferError:
-        raise
     except Exception as e:
-        logger.error(f"✗ Ошибка трансфера компонента: {e}", exc_info=True)
+        logger.error(
+            "Transfer failed: component=%s source=%s target=%s error=%s",
+            component.get('id', '?')[:8],
+            source_location.get('name', '?'),
+            target_location.get('name', '?'),
+            e,
+            exc_info=True
+        )
         return False
