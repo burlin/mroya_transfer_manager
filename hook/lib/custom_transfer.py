@@ -642,13 +642,33 @@ def transfer_component_custom(
         
         src_accessor_type = type(source_location.accessor).__name__ if source_location.accessor else 'None'
         if source_location.accessor:
-            if 's3' in str(type(source_location.accessor)).lower():
+            accessor = source_location.accessor
+            accessor_type = type(accessor)
+            accessor_name = accessor_type.__name__
+            if 's3' in str(accessor_type).lower():
                 is_s3_source = True
                 logger.debug("Source location %s: S3 accessor (%s)", src_name, src_accessor_type)
-            elif isinstance(source_location.accessor, ftrack_api.accessor.disk.DiskAccessor):
+            # Treat any accessor that behaves like DiskAccessor (has get_filesystem_path)
+            # as disk-backed, not only the exact ftrack_api.accessor.disk.DiskAccessor.
+            elif isinstance(accessor, ftrack_api.accessor.disk.DiskAccessor) or hasattr(accessor, "get_filesystem_path"):
                 is_disk_source = True
-                source_path = source_location.get_filesystem_path(component)
-                logger.debug("Source location %s: Disk accessor (%s), path=%s", src_name, src_accessor_type, source_path)
+                try:
+                    source_path = source_location.get_filesystem_path(component)
+                except Exception as e:
+                    logger.error(
+                        "Source location %s: accessor %s has get_filesystem_path but call failed: %s",
+                        src_name,
+                        accessor_name,
+                        e,
+                        exc_info=True,
+                    )
+                    return False
+                logger.debug(
+                    "Source location %s: Disk-like accessor (%s), path=%s",
+                    src_name,
+                    src_accessor_type,
+                    source_path,
+                )
         
         if not is_s3_source and not is_disk_source:
             logger.error(
@@ -669,12 +689,19 @@ def transfer_component_custom(
         
         dst_accessor_type = type(target_location.accessor).__name__ if target_location.accessor else 'None'
         if target_location.accessor:
-            if 's3' in str(type(target_location.accessor)).lower():
+            accessor = target_location.accessor
+            accessor_type = type(accessor)
+            accessor_name = accessor_type.__name__
+            if 's3' in str(accessor_type).lower():
                 is_s3_target = True
                 logger.debug("Target location %s: S3 accessor (%s)", dst_name, dst_accessor_type)
-            elif isinstance(target_location.accessor, ftrack_api.accessor.disk.DiskAccessor):
+            elif isinstance(accessor, ftrack_api.accessor.disk.DiskAccessor) or hasattr(accessor, "get_filesystem_path"):
                 is_disk_target = True
-                logger.debug("Target location %s: Disk accessor (%s)", dst_name, dst_accessor_type)
+                logger.debug(
+                    "Target location %s: Disk-like accessor (%s)",
+                    dst_name,
+                    accessor_name,
+                )
         
         if not is_s3_target and not is_disk_target:
             logger.error(
