@@ -228,6 +228,38 @@ transfer_logger = _setup_transfer_logger()
 # Helper functions for location type detection and component metadata
 # --------------------------------------------------------------------------- 
 
+def _looks_like_uuid(value: str) -> bool:
+    """Return True if string looks like a UUID (e.g. 6c73a09a-0931-450a-b824-260c9f79eb37)."""
+    if not value or not isinstance(value, str):
+        return False
+    s = value.strip()
+    if len(s) != 36:
+        return False
+    parts = s.split("-")
+    if len(parts) != 5:
+        return False
+    if [len(p) for p in parts] != [8, 4, 4, 4, 12]:
+        return False
+    try:
+        int(s.replace("-", ""), 16)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_location_display_name(session: Any, location_id: Any, fallback_label: str = "Unknown") -> Optional[str]:
+    """Resolve location id to display name (name or label) for UI. Returns None on error."""
+    if not session or not location_id:
+        return None
+    try:
+        loc = session.get("Location", str(location_id))
+        if loc:
+            return loc.get("name") or loc.get("label") or None
+    except Exception:
+        pass
+    return None
+
+
 def get_location_type(location: ftrack_api.entity.base.Entity) -> str:  # type: ignore[name-defined]
     """Determine location type (Disk, S3, etc.)."""
     if not location.accessor:
@@ -1155,6 +1187,8 @@ class BackgroundTransferManager:
             job_data['selection'] = selection
             job_data['from_location_id'] = from_location_id
             job_data['to_location_id'] = to_location_id
+            job_data['from_location_name'] = src_location.get('name') or src_location.get('label') or from_location_id
+            job_data['to_location_name'] = dst_location.get('name') or dst_location.get('label') or to_location_id
             # Default settings (can be changed via UI)
             # Load max_workers from settings if not specified in job_data
             # IMPORTANT: Don't use QtCore.QSettings in background thread - it can block!
@@ -2081,7 +2115,10 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                 return
             
             component_label = job_data.get('component_label', 'Unknown')
-            to_location_name = job_data.get('to_location_name', 'Unknown')
+            to_location_name = job_data.get('to_location_name')
+            if not to_location_name or _looks_like_uuid(to_location_name):
+                to_location_name = _resolve_location_display_name(self.session, job_data.get('to_location_id'), 'Destination')
+            to_location_name = to_location_name or 'Unknown'
             total_size_bytes = job_data.get('total_size_bytes', 0)
             
             row = self.job_table.rowCount()
