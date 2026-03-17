@@ -417,7 +417,7 @@ def copy_from_s3_to_disk(
             total_size = response['ContentLength']
         except Exception as e:
             logger.error(f"✗ Ошибка получения размера файла из S3: {e}")
-            return False, 0
+            raise RuntimeError(f"S3 head_object failed for key '{key}' in bucket '{bucket}': {e}") from e
         
         bytes_transferred = 0
         
@@ -671,11 +671,10 @@ def transfer_component_custom(
                 )
         
         if not is_s3_source and not is_disk_source:
-            logger.error(
-                "Source location %s has unsupported accessor: %s (expected S3 or Disk)",
-                src_name, src_accessor_type
+            raise RuntimeError(
+                f"Source location '{src_name}' has unsupported accessor type: '{src_accessor_type}' "
+                f"(expected S3 or DiskAccessor). Accessor is None — location plugin may not be registered."
             )
-            return False
         
         # 2. Генерируем target resource_identifier
         context = {'source_resource_identifier': source_resource_id}
@@ -704,11 +703,10 @@ def transfer_component_custom(
                 )
         
         if not is_s3_target and not is_disk_target:
-            logger.error(
-                "Target location %s has unsupported accessor: %s (expected S3 or Disk)",
-                dst_name, dst_accessor_type
+            raise RuntimeError(
+                f"Target location '{dst_name}' has unsupported accessor type: '{dst_accessor_type}' "
+                f"(expected S3 or DiskAccessor). Accessor is None — location plugin may not be registered."
             )
-            return False
         
         # For sequence: collect resource_identifiers per member (frame order) so we can register members for availability
         member_resource_ids = []
@@ -1131,8 +1129,10 @@ def transfer_component_custom(
                     )
         
         if not success:
-            logger.error("✗ Копирование не удалось")
-            return False
+            raise RuntimeError(
+                f"File copy failed: component='{comp_name}' ({comp_id[:8]}) "
+                f"src='{src_name}' dst='{dst_name}'"
+            )
         
         # 6. Регистрируем компонент в target location
         logger.info("Registering component %s in target location %s", comp_id[:8], dst_name)
@@ -1158,7 +1158,7 @@ def transfer_component_custom(
                                 }
                             )
                         except Exception as e:
-                            if 'DuplicateEntryError' not in str(type(e).__name__):
+                            if 'DuplicateEntryError' not in str(e):
                                 logger.warning(f"ComponentLocation for member {member.get('name')}: {e}")
                     logger.info(f"✓ Зарегистрировано {min(len(members_sorted), len(member_resource_ids))} members в target location")
             
@@ -1176,10 +1176,18 @@ def transfer_component_custom(
             
         except Exception as e:
             # Если компонент уже зарегистрирован, это нормально
-            if 'DuplicateEntryError' in str(type(e).__name__):
+            if 'DuplicateEntryError' in str(e):
                 logger.info(f"✓ Компонент уже зарегистрирован в target location")
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
                 return True
             logger.error(f"✗ Ошибка регистрации: {e}", exc_info=True)
+            try:
+                session.rollback()
+            except Exception:
+                pass
             return False
             
     except Exception as e:
@@ -1191,4 +1199,4 @@ def transfer_component_custom(
             e,
             exc_info=True
         )
-        return False
+        raise
