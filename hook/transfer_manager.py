@@ -20,7 +20,7 @@ import time
 import socket
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import ftrack_api  # type: ignore
 import ftrack_connect.ui.application  # type: ignore
@@ -445,20 +445,35 @@ class BackgroundTransferManager:
         self._running = False
         self._transfer_lock = threading.Lock()
         self._transfer_semaphore = threading.Semaphore(max_concurrent_transfers)  # Limit concurrent transfers
-        
-        # Queue for asynchronous Job updates (to avoid blocking copy thread)
-        self._job_update_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
-        self._job_update_thread = threading.Thread(target=self._job_update_worker, daemon=True)
-        self._job_update_thread.start()
-        
-        # Job status cache for quick checking without blocking copy thread
-        # Updated asynchronously in separate thread
-        self._job_status_cache: Dict[str, str] = {}  # {job_id: status}
-        self._job_status_cache_lock = threading.Lock()
-        self._job_status_check_queue: "queue.Queue[str]" = queue.Queue()  # Queue of job_id for status checking
-        self._job_status_check_thread = threading.Thread(target=self._job_status_check_worker, daemon=True)
-        self._job_status_check_thread.start()
-    
+
+    def _commit_job_progress_sync(self, job_id: str, job_data_dict: Dict[str, Any]) -> None:
+        """Write Job.data from the transfer worker thread only.
+
+        Avoids concurrent ftrack Session use (get/commit) from multiple threads,
+        which can hang or corrupt the client session.
+        """
+        try:
+            job = self._session.get("Job", job_id)
+            if job:
+                job["data"] = json.dumps(job_data_dict)
+                self._session.commit()
+        except Exception as exc:
+            logger.warning(
+                "Failed to commit job progress for %s: %s",
+                job_id[:8] if job_id else "?",
+                exc,
+            )
+
+    def _poll_job_status_sync(self, job_id: str) -> str:
+        """Read Job.status from the transfer worker thread (same thread as transfer)."""
+        try:
+            job = self._session.get("Job", job_id)
+            if job:
+                return str(job.get("status", "running") or "running")
+        except Exception:
+            pass
+        return "running"
+
     def set_max_concurrent_transfers(self, max_concurrent: int) -> None:
         """Update maximum number of concurrent transfers."""
         if max_concurrent < 1:
@@ -897,104 +912,6 @@ class BackgroundTransferManager:
                     self._transfer_semaphore.release()
                     self._queue.task_done()
 
-    def _job_update_worker(self) -> None:
-        """Worker for asynchronous Job updates in separate thread.
-        
-        This allows avoiding blocking the file copy thread with session.commit() calls.
-        """
-        while self._running:
-            try:
-                # Get Job update task (with timeout to check self._running)
-                update_data = self._job_update_queue.get(timeout=1.0)
-                
-                job_id = update_data.get('job_id')
-                job_data_dict = update_data.get('job_data')
-                
-                if job_id and job_data_dict:
-                    try:
-                        # Get Job and update its data
-                        job = self._session.get('Job', job_id)
-                        if job:
-                            job['data'] = json.dumps(job_data_dict)
-                            self._session.commit()
-                            logger.debug(f"Job {job_id[:8]} updated asynchronously")
-                    except Exception as exc:
-                        logger.warning(f"Failed to update job {job_id[:8]} asynchronously: {exc}")
-                
-                self._job_update_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as exc:
-                logger.error(f"Error in job update worker: {exc}", exc_info=True)
-    
-    def _job_status_check_worker(self) -> None:
-        """Worker for asynchronous Job status checking in separate thread.
-        
-        Updates status cache so copy thread can quickly check status
-        without blocking session.get() calls.
-        """
-        while self._running:
-            try:
-                # Get job_id for status check (with timeout)
-                job_id = self._job_status_check_queue.get(timeout=1.0)
-                
-                if job_id:
-                    try:
-                        # Get Job status from Ftrack
-                        job = self._session.get('Job', job_id)
-                        if job:
-                            status = job.get('status', 'unknown')
-                            # Update cache
-                            with self._job_status_cache_lock:
-                                self._job_status_cache[job_id] = status
-                    except Exception as exc:
-                        logger.warning(f"Failed to check job status {job_id[:8]}: {exc}")
-                
-                self._job_status_check_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as exc:
-                logger.error(f"Error in job status check worker: {exc}", exc_info=True)
-    
-    def _get_job_status_cached(self, job_id: str) -> Optional[str]:
-        """Get Job status from cache (fast, non-blocking).
-        
-        If status not in cache, adds job_id to queue for checking.
-        """
-        with self._job_status_cache_lock:
-            status = self._job_status_cache.get(job_id)
-        
-        # If status not in cache, add to queue for checking
-        if status is None:
-            try:
-                self._job_status_check_queue.put(job_id, block=False)
-            except queue.Full:
-                pass
-        
-        return status
-    
-    def _request_job_status_check(self, job_id: str) -> None:
-        """Request Job status check (asynchronously, non-blocking)."""
-        try:
-            self._job_status_check_queue.put(job_id, block=False)
-        except queue.Full:
-            pass
-    
-    def _update_job_async(self, job_id: str, job_data: Dict[str, Any]) -> None:
-        """Add task for asynchronous Job update.
-        
-        This does NOT block the file copy thread.
-        """
-        try:
-            self._job_update_queue.put({
-                'job_id': job_id,
-                'job_data': job_data
-            }, block=False)
-        except queue.Full:
-            logger.warning(f"Job update queue full, skipping update for job {job_id[:8]}")
-        except Exception as exc:
-            logger.warning(f"Failed to queue job update: {exc}")
-    
     def _run_transfer(self, task: _TransferTask) -> None:
         """Start transfer in separate thread.
         
@@ -1022,6 +939,52 @@ class BackgroundTransferManager:
             # Release semaphore in any case
             self._transfer_semaphore.release()
 
+    def _resolve_source_location_id_from_selection(
+        self, selection: List[Dict[str, Any]], to_location_id: Optional[str]
+    ) -> Optional[str]:
+        """Best-effort source location resolver when event has no from_location_id."""
+        if not selection:
+            return None
+        target_id = str(to_location_id) if to_location_id else ""
+        candidate_ids: List[str] = []
+        for entity in selection:
+            if not isinstance(entity, dict):
+                continue
+            entity_type = str(entity.get("entityType") or "").lower()
+            entity_id = str(entity.get("entityId") or "")
+            if entity_type != "component" or not entity_id:
+                continue
+            try:
+                component = self._session.query(
+                    f"select id, component_locations.location_id from Component where id is \"{entity_id}\""
+                ).first()
+                if not component:
+                    continue
+                loc_ids = [
+                    str(cl.get("location_id"))
+                    for cl in (component.get("component_locations") or [])
+                    if cl.get("location_id")
+                ]
+                candidate_ids.extend([loc for loc in loc_ids if loc != target_id])
+            except Exception:
+                continue
+        if not candidate_ids:
+            return None
+        # Choose location with highest precedence (lower priority value).
+        best: Optional[Tuple[int, str]] = None
+        for loc_id in candidate_ids:
+            try:
+                loc = self._session.get("Location", loc_id)
+                if not loc:
+                    continue
+                prio = int(getattr(loc, "priority", 999) or 999)
+                current = (prio, str(loc["id"]))
+                if best is None or current[0] < best[0]:
+                    best = current
+            except Exception:
+                continue
+        return best[1] if best else None
+
     def _process_task(self, task: _TransferTask) -> None:
         """Process transfer task using custom transfer.
         
@@ -1033,10 +996,28 @@ class BackgroundTransferManager:
         
         data = task.payload
         selection = data.get("selection") or []
-        from_location_id = data.get("from_location_id")
-        to_location_id = data.get("to_location_id")
+        component_ids = data.get("component_ids") or []
+        if not selection and component_ids:
+            selection = [
+                {"entityType": "Component", "entityId": str(component_id)}
+                for component_id in component_ids
+                if component_id
+            ]
+        from_location_id = data.get("from_location_id") or data.get("source_location_id")
+        to_location_id = data.get("to_location_id") or data.get("target_location_id")
         user_id = data.get("user_id")
         job_id = data.get("job_id")
+
+        if not from_location_id and selection:
+            from_location_id = self._resolve_source_location_id_from_selection(
+                selection=selection,
+                to_location_id=str(to_location_id) if to_location_id else None,
+            )
+            if from_location_id:
+                logger.info(
+                    "MroyaTransferManager: resolved from_location_id=%s from selection",
+                    str(from_location_id)[:8],
+                )
 
         logger.info(
             "MroyaTransferManager: processing transfer request (custom): from=%s to=%s, "
@@ -1278,11 +1259,9 @@ class BackgroundTransferManager:
                 last_log_time = [transfer_start_time]  # Time of last log
                 last_publish_time = [transfer_start_time]  # Time of last event publish
                 
-                # Cache for status checking (updated asynchronously in separate thread)
-                last_status_check_time = [time.time()]  # Time of last check
-                
-                # Initialize status cache for this job
-                self._request_job_status_check(job['id'])
+                # Poll Job.status from the transfer thread only (same thread as session)
+                last_status_check_time = [time.time()]
+                last_known_job_status = ['running']
                 
                 def progress_callback(bytes_transferred, total_size):
                     """
@@ -1298,21 +1277,11 @@ class BackgroundTransferManager:
                     # Get current time ONCE for all calculations
                     current_time = time.time()
                     
-                    # Check if job was stopped or paused by user
-                    # Use status cache (updated asynchronously) - does NOT block copy thread!
-                    should_request_check = current_time - last_status_check_time[0] >= 1.0
-                    
-                    if should_request_check:
-                        # Request status update (asynchronously, non-blocking)
-                        self._request_job_status_check(job['id'])
+                    # Poll Job.status at most once per second (same thread as transfer)
+                    if current_time - last_status_check_time[0] >= 1.0:
                         last_status_check_time[0] = current_time
-                    
-                    # Get status from cache (fast, non-blocking)
-                    status = self._get_job_status_cached(job['id'])
-                    
-                    # If status not yet cached, use default 'running'
-                    if status is None:
-                        status = 'running'
+                        last_known_job_status[0] = self._poll_job_status_sync(job['id'])
+                    status = last_known_job_status[0]
                     
                     # Check status and interrupt transfer if needed
                     if status == 'killed':
@@ -1356,8 +1325,7 @@ class BackgroundTransferManager:
                         job_data['elapsed_time'] = elapsed_time
                         job_data['speed_mbps'] = speed_mbps
                         
-                        # Commit to DB less frequently - every 5 seconds or every 10%
-                        # This is critical for performance, as commit blocks thread
+                        # Commit Job.data periodically (same thread as transfer; avoids concurrent Session use)
                         last_committed_progress = last_progress_event[0]
                         should_commit = (
                             current_time - last_commit_time[0] >= 5.0 or  # Every 5 seconds
@@ -1365,8 +1333,7 @@ class BackgroundTransferManager:
                         )
                         
                         if should_commit:
-                            # Update Job asynchronously to avoid blocking copy thread
-                            self._update_job_async(job['id'], job_data.copy())
+                            self._commit_job_progress_sync(job['id'], job_data.copy())
                             last_commit_time[0] = current_time
                         
                         # Log progress (every 10% overall progress or every 5 seconds)
@@ -1493,8 +1460,8 @@ class BackgroundTransferManager:
                     f"traceback={error_details[:2000]}"
                 )
                 
-                # Check if Job was stopped by user (use cache, non-blocking)
-                status = self._get_job_status_cached(job['id'])
+                # Check if Job was stopped by user
+                status = self._poll_job_status_sync(job['id'])
                 if status == 'killed':
                     # Job was stopped by user - don't update status
                     transfer_logger.info(f"JOB_CANCELLED | job_id={job['id']} | component transfer cancelled")
@@ -1509,6 +1476,29 @@ class BackgroundTransferManager:
                         job_data['description'] = f'Failed to transfer component: {exc}'
                         job['data'] = json.dumps(job_data)
                         self._session.commit()
+                    except Exception:
+                        pass
+                    # Publish failed status immediately so UI does not stay in "running".
+                    try:
+                        current_hostname = socket.gethostname().lower()
+                        current_progress = 0.0
+                        try:
+                            current_progress = float(job_data.get('progress', 0.0))
+                        except Exception:
+                            current_progress = 0.0
+                        self._session.event_hub.publish(
+                            ftrack_api.event.base.Event(
+                                topic='ftrack.transfer.status',
+                                data={
+                                    'job_id': job['id'],
+                                    'status': 'failed',
+                                    'progress': current_progress,
+                                    'elapsed_time': 0.0,
+                                },
+                                source={'hostname': current_hostname}
+                            ),
+                            on_error='ignore'
+                        )
                     except Exception:
                         pass
                     return
@@ -1651,6 +1641,23 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
     def __init__(self, session, parent=None):
         """Initialize the widget."""
         super(MroyaTransferManagerWidget, self).__init__(session, parent=parent)
+
+        # Dedicated session for Job reads/writes from the Qt main thread. The Connect session is
+        # shared with BackgroundTransferManager; using it from timers/slots while the transfer
+        # worker runs blocks the entire Connect UI (same Session is not thread-safe).
+        try:
+            self._ui_job_session = ftrack_api.Session(
+                server_url=self.session.server_url,
+                api_key=self.session.api_key,
+                api_user=self.session.api_user,
+                auto_connect_event_hub=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "MroyaTransferManagerWidget: failed to create UI Job session, using Connect session: %s",
+                exc,
+            )
+            self._ui_job_session = self.session
         
         # Create layout
         layout = QtWidgets.QVBoxLayout()
@@ -2013,7 +2020,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
             # If time not in event, initialize start_time from job_data
             if 'start_time' not in job_info:
                 try:
-                    job = self.session.get('Job', job_id)
+                    job = self._ui_job_session.get('Job', job_id)
                     if job:
                         job_data = json.loads(job.get('data', '{}') or '{}')
                         start_time = job_data.get('start_time')
@@ -2097,7 +2104,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                 logger.warning(f"MroyaTransferManagerWidget: job {job_id[:8]} already in active_jobs at row {self.active_jobs[job_id]['row']}, skipping duplicate add")
                 return
             
-            job = self.session.get('Job', job_id)
+            job = self._ui_job_session.get('Job', job_id)
             if not job:
                 logger.warning(f"MroyaTransferManagerWidget: job {job_id[:8]} not found in session")
                 return
@@ -2117,7 +2124,9 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
             component_label = job_data.get('component_label', 'Unknown')
             to_location_name = job_data.get('to_location_name')
             if not to_location_name or _looks_like_uuid(to_location_name):
-                to_location_name = _resolve_location_display_name(self.session, job_data.get('to_location_id'), 'Destination')
+                to_location_name = _resolve_location_display_name(
+                    self._ui_job_session, job_data.get('to_location_id'), 'Destination'
+                )
             to_location_name = to_location_name or 'Unknown'
             total_size_bytes = job_data.get('total_size_bytes', 0)
             
@@ -2275,7 +2284,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
         
         try:
             logger.info(f"Stop button clicked for job {job_id}")
-            job = self.session.get('Job', job_id)
+            job = self._ui_job_session.get('Job', job_id)
             if not job:
                 logger.warning(f"Job {job_id} not found")
                 # Re-enable buttons
@@ -2298,7 +2307,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                 job_data = json.loads(job.get('data', '{}') or '{}')
                 job_data['description'] = 'Transfer cancelled by user'
                 job['data'] = json.dumps(job_data)
-                self.session.commit()
+                self._ui_job_session.commit()
                 
                 # Log stop
                 logger.info(f"Job {job_id} status set to 'killed' and committed")
@@ -2314,7 +2323,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
             logger.error(f"Error in _stop_job for {job_id}: {e}", exc_info=True)
             # On error, try to re-enable buttons
             try:
-                job = self.session.get('Job', job_id)
+                job = self._ui_job_session.get('Job', job_id)
                 if job:
                     self._update_action_buttons(job_id, job.get('status'))
             except Exception:
@@ -2327,7 +2336,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
         
         try:
             logger.info(f"Pause button clicked for job {job_id}")
-            job = self.session.get('Job', job_id)
+            job = self._ui_job_session.get('Job', job_id)
             if not job:
                 # Re-enable buttons
                 self._update_action_buttons(job_id, 'unknown')
@@ -2345,7 +2354,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                 job_data = json.loads(job.get('data', '{}') or '{}')
                 job_data['description'] = 'Transfer paused by user'
                 job['data'] = json.dumps(job_data)
-                self.session.commit()
+                self._ui_job_session.commit()
                 
                 transfer_logger.info(f"JOB_PAUSED | job_id={job_id} | by user")
                 
@@ -2359,7 +2368,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
             logger.warning(f"Error in _pause_job for {job_id}: {e}")
             # On error, try to re-enable buttons
             try:
-                job = self.session.get('Job', job_id)
+                job = self._ui_job_session.get('Job', job_id)
                 if job:
                     self._update_action_buttons(job_id, job.get('status'))
             except Exception:
@@ -2372,7 +2381,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
         
         try:
             logger.info(f"Resume button clicked for job {job_id}")
-            job = self.session.get('Job', job_id)
+            job = self._ui_job_session.get('Job', job_id)
             if not job:
                 # Re-enable buttons
                 self._update_action_buttons(job_id, 'unknown')
@@ -2390,7 +2399,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                 job_data = json.loads(job.get('data', '{}') or '{}')
                 job_data['description'] = 'Transfer resumed by user'
                 job['data'] = json.dumps(job_data)
-                self.session.commit()
+                self._ui_job_session.commit()
                 
                 transfer_logger.info(f"JOB_RESUMED | job_id={job_id} | by user")
                 
@@ -2422,7 +2431,7 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
             logger.warning(f"Error in _resume_job for {job_id}: {e}")
             # On error, try to re-enable buttons
             try:
-                job = self.session.get('Job', job_id)
+                job = self._ui_job_session.get('Job', job_id)
                 if job:
                     self._update_action_buttons(job_id, job.get('status'))
             except Exception:
@@ -2557,7 +2566,9 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
         
         try:
             job_ids = list(self.active_jobs.keys())
-            jobs = self.session.query('Job where id in ({})'.format(','.join(f'"{jid}"' for jid in job_ids))).all()
+            jobs = self._ui_job_session.query(
+                'Job where id in ({})'.format(','.join(f'"{jid}"' for jid in job_ids))
+            ).all()
             
             for job in jobs:
                 job_id = job['id']
@@ -2570,6 +2581,8 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                 progress_item = self.job_table.item(row, 4)  # Progress column
                 time_item = self.job_table.item(row, 5)  # Time column
                 speed_item = self.job_table.item(row, 6)  # Speed column
+
+                job_data = json.loads(job.get('data', '{}') or '{}')
                 
                 if status_item:
                     status_item.setText(job.get('status', 'unknown'))
@@ -2578,7 +2591,6 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                 # This prevents conflicts and value jumps due to asynchronous job_data updates
                 # If progress not set in UI (first time), set from job_data as fallback
                 if progress_item and not progress_item.text():
-                    job_data = json.loads(job.get('data', '{}') or '{}')
                     progress = job_data.get('progress', 0.0)
                     if progress is not None:
                         progress_percent = int(progress * 100) if isinstance(progress, (int, float)) else 0
