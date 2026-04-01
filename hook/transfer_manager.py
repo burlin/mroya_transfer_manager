@@ -1081,14 +1081,18 @@ class BackgroundTransferManager:
         
         if not job:
             try:
+                # Создаём Job в состоянии "queued" — фактический запуск будет
+                # помечен как running уже в процессе трансфера.
                 job = self._session.create(
                     'Job',
                     {
                         'user_id': user_id,
-                        'status': 'running',
-                        'data': json.dumps({
-                            'description': 'Transfer components (Gathering...)'
-                        }),
+                        'status': 'queued',
+                        'data': json.dumps(
+                            {
+                                'description': 'Transfer components (Gathering...)'
+                            }
+                        ),
                     },
                 )
                 self._session.commit()
@@ -1096,14 +1100,9 @@ class BackgroundTransferManager:
                 logger.error("MroyaTransferManager: failed to create Job: %s", exc, exc_info=True)
                 return
 
-        try:
-            # Update Job status
-            job['status'] = 'running'
-            job_data = json.loads(job.get('data', '{}') or '{}')
-            job['data'] = json.dumps(job_data)
-            self._session.commit()
-        except Exception:
-            pass
+        # На этом этапе задача взята в работу worker'ом, но реальный прогресс
+        # ещё не начался. Статус "running" будет установлен при обновлении
+        # описания и старта таймера ниже.
 
         # Get components from selection (session only needed for metadata)
         try:
@@ -1428,14 +1427,35 @@ class BackgroundTransferManager:
                     completed_components[0] += 1
                 else:
                     failed_count += 1
+                    # transfer_component_custom returned False without raising an explicit exception.
+                    # Log as much context as possible so we can debug cases where bytes were copied
+                    # on disk but the component was not registered in ftrack (or vice versa).
                     logger.warning(
-                        "MroyaTransferManager: transfer_component_custom returned False for component %s",
-                        component.get('id', '?')[:8]
+                        "MroyaTransferManager: transfer_component_custom returned False for component_id=%s "
+                        "name=%s src=%s dst=%s job_id=%s",
+                        component.get('id', '?'),
+                        component.get('name', '?'),
+                        src_location.get('name', '?'),
+                        dst_location.get('name', '?'),
+                        getattr(job, 'id', job.get('id') if isinstance(job, dict) else None) if job else None,
+                    )
+                    transfer_logger.warning(
+                        "COMPONENT_TRANSFER_WARNING | reason=transfer_component_custom_false | "
+                        "job_id=%s | component_id=%s | component_name=%s | src=%s | dst=%s",
+                        getattr(job, 'id', job.get('id') if isinstance(job, dict) else None) if job else None,
+                        component.get('id', 'unknown'),
+                        component.get('name', '?'),
+                        src_location.get('name', '?'),
+                        dst_location.get('name', '?'),
                     )
                     # Even on error, component is considered processed
                     completed_components[0] += 1
                     if not ignore_errors:
-                        raise Exception(f"Failed to transfer component {component['id']}")
+                        raise Exception(
+                            f"transfer_component_custom returned False for component "
+                            f"{component.get('id')} ({component.get('name')}) "
+                            f"{src_location.get('name', '?')} -> {dst_location.get('name', '?')}"
+                        )
             except InterruptedError:
                 # Transfer was stopped by user
                 logger.info('Transfer cancelled by user (InterruptedError)')
@@ -1984,6 +2004,11 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
             speed_item = self.job_table.item(row, 6)  # Speed column
             
             if status_item:
+                # Статус "running" считаем источником правды только из событий.
+                # Если статус пришёл как "running" и раньше не было has_started,
+                # инициализируем переход queued -> running.
+                if status == "running":
+                    job_info["has_started"] = True
                 status_item.setText(status)
             
             progress = data.get('progress', 0.0)
@@ -2140,8 +2165,10 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
             size_text = self._format_size(total_size_bytes) if total_size_bytes > 0 else "N/A"
             self.job_table.setItem(row, 2, QtWidgets.QTableWidgetItem(size_text))
             
-            # Status column
-            self.job_table.setItem(row, 3, QtWidgets.QTableWidgetItem(job.get('status', 'unknown')))
+            # Status column: новые задачи показываем как queued независимо от Job.status.
+            # Фактический переход в running произойдет при первом ftrack.transfer.status.
+            status_text = "queued"
+            self.job_table.setItem(row, 3, QtWidgets.QTableWidgetItem(status_text))
             
             # Progress column
             progress = job_data.get('progress', 0.0)
@@ -2583,9 +2610,22 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                 speed_item = self.job_table.item(row, 6)  # Speed column
 
                 job_data = json.loads(job.get('data', '{}') or '{}')
-                
+
+                # Вычисляем "эффективный" статус для UI.
+                # Пока задача не стартовала (has_started=False), не позволяем серверному
+                # Job.status преждевременно перевести queued -> running.
+                effective_status = job.get('status', 'unknown')
                 if status_item:
-                    status_item.setText(job.get('status', 'unknown'))
+                    current_ui_status = status_item.text()
+                    if job_info.get("has_started"):
+                        # Задача уже реально стартовала: синхронизируем UI с Job.status.
+                        effective_status = job.get('status', 'unknown')
+                        status_item.setText(effective_status)
+                    else:
+                        # Задача ещё не стартовала: оставляем отображаемый статус таким,
+                        # какой он есть (обычно "queued"), даже если в Job.status уже "running".
+                        effective_status = current_ui_status or effective_status
+                        status_item.setText(effective_status)
                 
                 # Progress updates from events, not from job_data
                 # This prevents conflicts and value jumps due to asynchronous job_data updates
@@ -2617,12 +2657,14 @@ class MroyaTransferManagerWidget(ftrack_connect.ui.application.ConnectWidget):
                     else:
                         speed_item.setText("N/A")
                 
+                # Для логического завершения джоба (очистка active_jobs) используем
+                # фактический Job.status из БД.
                 status = job.get('status')
-                # Update row color based on status
-                self._update_row_color(row, status)
-                
-                # Update control buttons
-                self._update_action_buttons(job_id, status)
+
+                # Обновляем цвет строки и кнопки исходя из "эффективного" статуса,
+                # который учитывает has_started и не поднимает queued в running преждевременно.
+                self._update_row_color(row, effective_status)
+                self._update_action_buttons(job_id, effective_status)
                 
                 if status in ('done', 'failed'):
                     self.active_jobs.pop(job_id, None)
@@ -2663,11 +2705,22 @@ def register(session: ftrack_api.Session, **kw) -> None:  # type: ignore[name-de
     logger.info("MroyaTransferManager: transfer_component_custom is available")
     
     # Create and register background manager.
-    # Load max_concurrent_transfers setting from QSettings
+    # Load max_concurrent_transfers setting from QSettings, but clamp to 1 by default
+    # for maximum stability (only one transfer job at a time).
     try:
         from ftrack_connect.qt import QtCore  # pyright: ignore[reportMissingImports]
         settings = QtCore.QSettings("mroya", "TransferManager")
         max_concurrent = settings.value("max_concurrent_transfers", 1, type=int)
+        # Ensure valid integer and clamp to at least 1.
+        if not isinstance(max_concurrent, int) or max_concurrent < 1:
+            max_concurrent = 1
+        # For now we hard-cap concurrent jobs to 1 to avoid race conditions.
+        if max_concurrent > 1:
+            logger.info(
+                "MroyaTransferManager: clamping max_concurrent_transfers from %d to 1 for stability",
+                max_concurrent,
+            )
+            max_concurrent = 1
         logger.info("MroyaTransferManager: max_concurrent_transfers=%d", max_concurrent)
     except Exception as e:
         logger.warning("MroyaTransferManager: Failed to load settings: %s", e)
