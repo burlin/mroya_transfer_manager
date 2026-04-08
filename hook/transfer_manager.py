@@ -437,6 +437,7 @@ class BackgroundTransferManager:
 
     def __init__(self, session: ftrack_api.Session, max_concurrent_transfers: int = 1) -> None:  # type: ignore[name-defined]
         self._session = session
+        self._thread_local = threading.local()
         self._max_concurrent = max_concurrent_transfers
         self._queue: "queue.Queue[_TransferTask]" = queue.Queue()
         self._active_transfers: Dict[str, threading.Thread] = {}  # {job_id: thread}
@@ -446,6 +447,23 @@ class BackgroundTransferManager:
         self._transfer_lock = threading.Lock()
         self._transfer_semaphore = threading.Semaphore(max_concurrent_transfers)  # Limit concurrent transfers
 
+    def _get_worker_session(self) -> ftrack_api.Session:  # type: ignore[name-defined]
+        """Return per-thread ftrack Session for transfer DB operations.
+
+        Using a dedicated Session per worker thread avoids cross-thread access to
+        the main Connect Session, which can freeze UI/event processing.
+        """
+        worker_session = getattr(self._thread_local, "session", None)
+        if worker_session is None:
+            worker_session = ftrack_api.Session(
+                server_url=self._session.server_url,
+                api_key=self._session.api_key,
+                api_user=self._session.api_user,
+                auto_connect_event_hub=False,
+            )
+            self._thread_local.session = worker_session
+        return worker_session
+
     def _commit_job_progress_sync(self, job_id: str, job_data_dict: Dict[str, Any]) -> None:
         """Write Job.data from the transfer worker thread only.
 
@@ -453,10 +471,11 @@ class BackgroundTransferManager:
         which can hang or corrupt the client session.
         """
         try:
-            job = self._session.get("Job", job_id)
+            session = self._get_worker_session()
+            job = session.get("Job", job_id)
             if job:
                 job["data"] = json.dumps(job_data_dict)
-                self._session.commit()
+                session.commit()
         except Exception as exc:
             logger.warning(
                 "Failed to commit job progress for %s: %s",
@@ -467,7 +486,8 @@ class BackgroundTransferManager:
     def _poll_job_status_sync(self, job_id: str) -> str:
         """Read Job.status from the transfer worker thread (same thread as transfer)."""
         try:
-            job = self._session.get("Job", job_id)
+            session = self._get_worker_session()
+            job = session.get("Job", job_id)
             if job:
                 return str(job.get("status", "running") or "running")
         except Exception:
@@ -661,7 +681,7 @@ class BackgroundTransferManager:
             user_matches = False
             if user_id:
                 try:
-                    user_entity = self._session.get("User", user_id)
+                    user_entity = self._get_worker_session().get("User", user_id)
                     if user_entity:
                         user_username = user_entity.get("username")
                         if user_username == current_user_id:
@@ -845,7 +865,7 @@ class BackgroundTransferManager:
             if job_id:
                 # Check job status and settings
                 try:
-                    job = self._session.get('Job', job_id)
+                    job = self._get_worker_session().get('Job', job_id)
                     if job:
                         status = job.get('status')
                         # If paused, skip (wait for resume)
@@ -943,6 +963,7 @@ class BackgroundTransferManager:
         self, selection: List[Dict[str, Any]], to_location_id: Optional[str]
     ) -> Optional[str]:
         """Best-effort source location resolver when event has no from_location_id."""
+        session = self._get_worker_session()
         if not selection:
             return None
         target_id = str(to_location_id) if to_location_id else ""
@@ -955,7 +976,7 @@ class BackgroundTransferManager:
             if entity_type != "component" or not entity_id:
                 continue
             try:
-                component = self._session.query(
+                component = session.query(
                     f"select id, component_locations.location_id from Component where id is \"{entity_id}\""
                 ).first()
                 if not component:
@@ -974,7 +995,7 @@ class BackgroundTransferManager:
         best: Optional[Tuple[int, str]] = None
         for loc_id in candidate_ids:
             try:
-                loc = self._session.get("Location", loc_id)
+                loc = session.get("Location", loc_id)
                 if not loc:
                     continue
                 prio = int(getattr(loc, "priority", 999) or 999)
@@ -994,6 +1015,8 @@ class BackgroundTransferManager:
         # Use main session only for metadata and Job updates
         # Session is NOT needed for file transfer itself
         
+        session = self._get_worker_session()
+        app_session = self._session
         data = task.payload
         selection = data.get("selection") or []
         component_ids = data.get("component_ids") or []
@@ -1039,8 +1062,8 @@ class BackgroundTransferManager:
         # Get Location and, if needed, existing Job.
         # This is the only place where session is needed for metadata
         try:
-            src_location = self._session.get("Location", str(from_location_id))
-            dst_location = self._session.get("Location", str(to_location_id))
+            src_location = app_session.get("Location", str(from_location_id))
+            dst_location = app_session.get("Location", str(to_location_id))
             logger.info(
                 "MroyaTransferManager: resolved locations src=%s (id=%s) dst=%s (id=%s) "
                 "src_structure=%s dst_structure=%s src_accessor=%s dst_accessor=%s",
@@ -1070,7 +1093,7 @@ class BackgroundTransferManager:
         job = None
         if job_id:
             try:
-                job = self._session.get("Job", str(job_id))
+                job = session.get("Job", str(job_id))
             except Exception as exc:
                 logger.warning(
                     "MroyaTransferManager: failed to fetch pre-created Job %s: %s",
@@ -1083,7 +1106,7 @@ class BackgroundTransferManager:
             try:
                 # Создаём Job в состоянии "queued" — фактический запуск будет
                 # помечен как running уже в процессе трансфера.
-                job = self._session.create(
+                job = session.create(
                     'Job',
                     {
                         'user_id': user_id,
@@ -1095,7 +1118,7 @@ class BackgroundTransferManager:
                         ),
                     },
                 )
-                self._session.commit()
+                session.commit()
             except Exception as exc:
                 logger.error("MroyaTransferManager: failed to create Job: %s", exc, exc_info=True)
                 return
@@ -1125,7 +1148,7 @@ class BackgroundTransferManager:
                 job_data = json.loads(job.get('data', '{}') or '{}')
                 job_data['description'] = f'Failed to get components: {exc}'
                 job['data'] = json.dumps(job_data)
-                self._session.commit()
+                session.commit()
             except Exception:
                 pass
             return
@@ -1143,7 +1166,7 @@ class BackgroundTransferManager:
                 job_data = json.loads(job.get('data', '{}') or '{}')
                 job_data['description'] = f'No components found in source location {src_location.get("name", "unknown")}'
                 job['data'] = json.dumps(job_data)
-                self._session.commit()
+                session.commit()
             except Exception:
                 pass
             return
@@ -1177,7 +1200,7 @@ class BackgroundTransferManager:
                 job_data['max_workers'] = 10  # Default
             job_data['auto_start'] = job_data.get('auto_start', True)  # Auto-start by default
             job['data'] = json.dumps(job_data)
-            self._session.commit()
+            session.commit()
             
             # Log transfer start
             transfer_logger.info(
@@ -1238,7 +1261,7 @@ class BackgroundTransferManager:
                         job_data = json.loads(job.get('data', '{}') or '{}')
                         job_data['description'] = f'Component {component_id[:8]} already being transferred in another job'
                         job['data'] = json.dumps(job_data)
-                        self._session.commit()
+                        session.commit()
                     except Exception:
                         pass
                     failed_count += 1
@@ -1251,129 +1274,117 @@ class BackgroundTransferManager:
                 # Get current job_data to pass to transfer_component_custom
                 job_data = json.loads(job.get('data', '{}') or '{}')
                 
-                # Create progress callback
-                # IMPORTANT: Progress should be from total component size (file or sequence)
-                last_progress_event = [0.0, 0.0]  # [component_progress, elapsed_time]
-                last_commit_time = [transfer_start_time]  # Time of last commit
-                last_log_time = [transfer_start_time]  # Time of last log
-                last_publish_time = [transfer_start_time]  # Time of last event publish
-                
-                # Poll Job.status from the transfer thread only (same thread as session)
-                last_status_check_time = [time.time()]
-                last_known_job_status = ['running']
-                
+                # Progress state is updated in callback (no Session operations there).
+                # A monitor thread performs status polling, commits, logs and publishes.
+                progress_lock = threading.Lock()
+                progress_state = {
+                    'safe_total_size': 0.0,
+                    'component_bytes': 0.0,
+                    'component_progress': 0.0,
+                    'overall_progress': float(job_data.get('progress', 0.0) or 0.0),
+                    'elapsed_time': 0.0,
+                    'speed_mbps': None,
+                }
+                control_state = {'status': 'running'}
+                monitor_stop_event = threading.Event()
+
                 def progress_callback(bytes_transferred, total_size):
-                    """
-                    Callback for current component progress.
-                    
-                    bytes_transferred: number of bytes transferred for current component
-                    total_size: total size of current component (file or sequence)
-                    
-                    Calculate:
-                    - component_progress: progress of current component (0.0 - 1.0)
-                    - overall_progress: overall progress of all components (0.0 - 1.0)
-                    """
-                    # Get current time ONCE for all calculations
-                    current_time = time.time()
-                    
-                    # Poll Job.status at most once per second (same thread as transfer)
-                    if current_time - last_status_check_time[0] >= 1.0:
-                        last_status_check_time[0] = current_time
-                        last_known_job_status[0] = self._poll_job_status_sync(job['id'])
-                    status = last_known_job_status[0]
-                    
-                    # Check status and interrupt transfer if needed
+                    """Hot-path callback: update in-memory progress only."""
+                    status = control_state.get('status', 'running')
                     if status == 'killed':
                         raise InterruptedError("Transfer cancelled by user")
-                    elif status == 'paused':
+                    if status == 'paused':
                         raise InterruptedError("Transfer paused by user")
-                    
-                    if total_size > 0:
-                        # Current component progress (0.0 - 1.0)
-                        component_progress = float(bytes_transferred) / float(total_size)
-                        
-                        # Overall progress of all components
-                        # Formula: (completed_components[0] + component_progress) / total_components
+
+                    if total_size <= 0:
+                        return
+
+                    current_time = time.time()
+                    safe_total_size = max(float(total_size), 1.0)
+                    safe_bytes_transferred = max(0.0, float(bytes_transferred))
+                    with progress_lock:
+                        component_bytes = max(progress_state['component_bytes'], safe_bytes_transferred)
+                        component_bytes = min(component_bytes, safe_total_size)
+                        component_progress = component_bytes / safe_total_size
                         if total_components > 0:
-                            overall_progress = (completed_components[0] + component_progress) / float(total_components)
+                            raw_overall = (completed_components[0] + component_progress) / float(total_components)
                         else:
-                            overall_progress = component_progress
-                        
-                        # Calculate time from start of all components transfer
+                            raw_overall = component_progress
+                        overall_progress = max(progress_state['overall_progress'], raw_overall)
+                        overall_progress = min(1.0, overall_progress)
                         elapsed_time = current_time - transfer_start_time
-                        
-                        # Calculate speed from total bytes transferred
-                        # Accumulate bytes: previous components + current component
-                        # IMPORTANT: bytes_transferred is progress of current component
-                        # Need to calculate total bytes:
-                        # - completed_components already transferred their bytes
-                        # - current component transferred bytes_transferred from total_size
-                        # But we don't know sizes of previous components...
-                        # For now use simplified approach: speed from current component
-                        # TODO: Can improve by accumulating total_bytes of each component
                         speed_mbps = None
                         if elapsed_time > 0:
-                            # Speed in MB/s from transfer start
-                            # Use bytes_transferred for current component
-                            # This gives instantaneous speed, not average from all components
-                            speed_mbps = (bytes_transferred / (1024 * 1024)) / elapsed_time
-                        
-                        # Update job_data in memory (fast)
-                        # Use overall_progress for UI display
+                            speed_mbps = (component_bytes / (1024 * 1024)) / elapsed_time
+
+                        progress_state['safe_total_size'] = safe_total_size
+                        progress_state['component_bytes'] = component_bytes
+                        progress_state['component_progress'] = component_progress
+                        progress_state['overall_progress'] = overall_progress
+                        progress_state['elapsed_time'] = elapsed_time
+                        progress_state['speed_mbps'] = speed_mbps
+
+                def progress_monitor():
+                    """Out-of-band monitor for status checks and Session writes."""
+                    last_status_check_time = transfer_start_time
+                    last_commit_time = transfer_start_time
+                    last_log_time = transfer_start_time
+                    last_publish_time = transfer_start_time
+                    last_logged_progress = progress_state['overall_progress']
+                    last_committed_progress = progress_state['overall_progress']
+                    while not monitor_stop_event.is_set():
+                        current_time = time.time()
+
+                        if current_time - last_status_check_time >= 2.0:
+                            last_status_check_time = current_time
+                            control_state['status'] = self._poll_job_status_sync(job['id'])
+
+                        with progress_lock:
+                            snapshot = dict(progress_state)
+
+                        overall_progress = float(snapshot.get('overall_progress', 0.0) or 0.0)
+                        elapsed_time = float(snapshot.get('elapsed_time', 0.0) or 0.0)
+                        speed_mbps = snapshot.get('speed_mbps')
+                        component_progress = float(snapshot.get('component_progress', 0.0) or 0.0)
+                        component_bytes = int(snapshot.get('component_bytes', 0.0) or 0.0)
+                        safe_total_size = int(snapshot.get('safe_total_size', 0.0) or 0.0)
+
                         job_data['progress'] = overall_progress
                         job_data['elapsed_time'] = elapsed_time
                         job_data['speed_mbps'] = speed_mbps
-                        
-                        # Commit Job.data periodically (same thread as transfer; avoids concurrent Session use)
-                        last_committed_progress = last_progress_event[0]
+
                         should_commit = (
-                            current_time - last_commit_time[0] >= 5.0 or  # Every 5 seconds
-                            abs(overall_progress - last_committed_progress) >= 0.10  # Or every 10% overall progress
+                            current_time - last_commit_time >= 5.0 or
+                            abs(overall_progress - last_committed_progress) >= 0.10
                         )
-                        
                         if should_commit:
                             self._commit_job_progress_sync(job['id'], job_data.copy())
-                            last_commit_time[0] = current_time
-                        
-                        # Log progress (every 10% overall progress or every 5 seconds)
-                        # Use separate variable for last log time
-                        last_logged_progress = last_progress_event[0]
-                        time_since_last_log = current_time - last_log_time[0]
+                            last_commit_time = current_time
+                            last_committed_progress = overall_progress
+
                         should_log = (
-                            abs(overall_progress - last_logged_progress) >= 0.10 or  # Every 10% overall progress
-                            time_since_last_log >= 5.0  # Or every 5 seconds
+                            current_time - last_log_time >= 5.0 or
+                            abs(overall_progress - last_logged_progress) >= 0.10
                         )
-                        
-                        if should_log:
-                            last_progress_event[0] = overall_progress
-                            last_progress_event[1] = elapsed_time
-                            last_log_time[0] = current_time
-                            
+                        if should_log and safe_total_size > 0:
+                            last_log_time = current_time
+                            last_logged_progress = overall_progress
                             transfer_logger.info(
                                 f"JOB_PROGRESS | job_id={job['id']} | "
                                 f"overall_progress={overall_progress*100:.1f}% | "
                                 f"component_progress={component_progress*100:.1f}% | "
-                                f"component_bytes={bytes_transferred}/{total_size} | "
+                                f"component_bytes={component_bytes}/{safe_total_size} | "
                                 f"time={elapsed_time:.1f}s | "
                                 f"speed={speed_mbps:.2f} MB/s" if speed_mbps else "speed=N/A"
                             )
-                        
-                        # Publish progress event with fixed frequency (every 1.5 seconds)
-                        # This ensures stable UI updates without jumps
-                        time_since_last_publish = current_time - last_publish_time[0]
+
                         should_publish = (
-                            time_since_last_publish >= 1.5 or  # Fixed frequency: every 1.5 seconds
-                            overall_progress >= 1.0  # Or on completion
+                            current_time - last_publish_time >= 1.5 or
+                            overall_progress >= 1.0
                         )
-                        
                         if should_publish:
-                            last_publish_time[0] = current_time
+                            last_publish_time = current_time
                             try:
-                                # Publish event asynchronously to avoid blocking transfer thread
-                                # Include time and speed in event for UI updates
-                                # Use overall_progress for UI display
-                                # IMPORTANT: Include hostname in source for proper filtering
-                                import socket
                                 current_hostname = socket.gethostname().lower()
                                 self._session.event_hub.publish(
                                     ftrack_api.event.base.Event(
@@ -1381,7 +1392,7 @@ class BackgroundTransferManager:
                                         data={
                                             'job_id': job['id'],
                                             'status': 'running',
-                                            'progress': overall_progress,  # Overall progress of all components
+                                            'progress': overall_progress,
                                             'elapsed_time': elapsed_time,
                                             'speed_mbps': speed_mbps,
                                         },
@@ -1391,6 +1402,11 @@ class BackgroundTransferManager:
                                 )
                             except Exception:
                                 pass
+
+                        monitor_stop_event.wait(0.5)
+
+                monitor_thread = threading.Thread(target=progress_monitor, daemon=True)
+                monitor_thread.start()
                 
                 # Call custom transfer
                 logger.debug(
@@ -1401,19 +1417,23 @@ class BackgroundTransferManager:
                     src_location.get('name', '?'),
                     dst_location.get('name', '?'),
                 )
-                success = transfer_component_custom(
-                    session=self._session,
-                    component=component,
-                    source_location=src_location,
-                    target_location=dst_location,
-                    job_data=job_data,
-                    progress_callback=progress_callback
-                )
+                try:
+                    success = transfer_component_custom(
+                        session=app_session,
+                        component=component,
+                        source_location=src_location,
+                        target_location=dst_location,
+                        job_data=job_data,
+                        progress_callback=progress_callback
+                    )
+                finally:
+                    monitor_stop_event.set()
+                    monitor_thread.join(timeout=2.0)
                 
                 # Final job_data update after transfer completion
                 try:
                     job['data'] = json.dumps(job_data)
-                    self._session.commit()
+                    session.commit()
                 except Exception:
                     pass
                 
@@ -1495,7 +1515,7 @@ class BackgroundTransferManager:
                         job_data = json.loads(job.get('data', '{}') or '{}')
                         job_data['description'] = f'Failed to transfer component: {exc}'
                         job['data'] = json.dumps(job_data)
-                        self._session.commit()
+                        session.commit()
                     except Exception:
                         pass
                     # Publish failed status immediately so UI does not stay in "running".
@@ -1596,7 +1616,7 @@ class BackgroundTransferManager:
                 if total_bytes > 0 and final_elapsed_time > 0:
                     job_data['speed_mbps'] = (total_bytes / (1024 * 1024)) / final_elapsed_time
                 job['data'] = json.dumps(job_data)
-                self._session.commit()
+                session.commit()
                 
                 # Log completion
                 transfer_logger.info(
@@ -1614,7 +1634,7 @@ class BackgroundTransferManager:
                 job_data['description'] = f'Transferred {success_count}/{len(components)} components ({failed_count} failed)'
                 job_data['elapsed_time'] = final_elapsed_time
                 job['data'] = json.dumps(job_data)
-                self._session.commit()
+                session.commit()
                 
                 # Log error
                 transfer_logger.warning(
