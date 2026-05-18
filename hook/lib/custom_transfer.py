@@ -1080,6 +1080,16 @@ def transfer_component_custom(
                 # Disk -> Disk
                 if len(sequence_files) > 1:
                     # Последовательность файлов
+                    # Общий размер последовательности для прогресса
+                    total_size = 0
+                    for path in sequence_files:
+                        try:
+                            if os.path.exists(path):
+                                total_size += os.path.getsize(path)
+                        except Exception as e:
+                            logger.warning("Не удалось получить размер файла %s: %s", path, e)
+                    logger.info("  Общий размер последовательности (Disk -> Disk): %d bytes", total_size)
+
                     total_bytes = 0
                     files_copied = 0
                     
@@ -1109,6 +1119,13 @@ def transfer_component_custom(
                             total_bytes += file_bytes
                             files_copied += 1
                             member_resource_ids.append(file_resource_id)
+                            # Обновляем прогресс по мере копирования последовательности
+                            if progress_callback and total_size > 0:
+                                try:
+                                    progress_callback(total_bytes, total_size)
+                                except Exception:
+                                    # Не даём прогрессу уронить весь трансфер
+                                    logger.debug("progress_callback raised, ignoring", exc_info=True)
                     
                     if files_copied == len(sequence_files):
                         logger.info(f"✓ Последовательность скопирована: {files_copied}/{len(sequence_files)} файлов, {total_bytes} bytes")
